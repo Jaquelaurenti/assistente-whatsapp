@@ -11,13 +11,17 @@ import json
 load_dotenv()
 init_db()
 
-client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+# 🔥 CORREÇÃO: strip() para evitar erro de header
+api_key = os.getenv("GROQ_API_KEY", "").strip()
+
+client = Groq(api_key=api_key)
+
 
 def carregar_config():
     try:
         with open("config.json", "r", encoding="utf-8") as f:
             return json.load(f)
-    except:
+    except Exception:
         return {
             "nome_assistente": "Assistente",
             "tom": "amigavel e direto",
@@ -26,123 +30,101 @@ def carregar_config():
             "saudacao": "Oi! Como posso te ajudar?"
         }
 
+
 def montar_system_prompt(config, tarefas, lembretes):
     regras = "\n".join([f"- {r}" for r in config.get("regras_extras", [])])
 
     contexto_tarefas = ""
     if tarefas:
         itens = "\n".join([
-            "- [ID:{}] {} | prioridade: {}".format(t[0], t[1], t[2]) +
-            (" | prazo: {}".format(t[3]) if t[3] else "")
+            f"- [ID:{t[0]}] {t[1]} | prioridade: {t[2]}" +
+            (f" | prazo: {t[3]}" if t[3] else "")
             for t in tarefas
         ])
-        contexto_tarefas = "\n\nTarefas pendentes do usuario (ordenadas por prioridade):\n" + itens
+        contexto_tarefas = f"\n\nTarefas pendentes:\n{itens}"
 
     contexto_lembretes = ""
     if lembretes:
-        itens = "\n".join(["- [ID:{}] {} as {}".format(l[0], l[1], l[2]) for l in lembretes])
-        contexto_lembretes = "\n\nLembretes agendados:\n" + itens
+        itens = "\n".join([
+            f"- [ID:{l[0]}] {l[1]} às {l[2]}"
+            for l in lembretes
+        ])
+        contexto_lembretes = f"\n\nLembretes:\n{itens}"
 
-    return """Voce e {nome}, um assistente de produtividade pessoal no WhatsApp.
-Tom: {tom}
-Idioma: {idioma}
+    return f"""
+Voce e {config.get("nome_assistente")}, um assistente de produtividade pessoal no WhatsApp.
+Tom: {config.get("tom")}
+Idioma: {config.get("idioma")}
 
-Voce ajuda o usuario com os seguintes caminhos:
+Funcoes:
 
-1. TAREFA: quando mencionar algo que precisa fazer
-   Use a tag [TAREFA prioridade:alta/normal/baixa prazo:DD/MM: descricao]
-   Identifique a prioridade pelo contexto (urgente, hoje, importante = alta)
-
-2. CONCLUIR: quando disser que terminou ou concluiu algo
-   Use a tag [CONCLUIR: parte do nome da tarefa]
-
-3. LEMBRETE: quando pedir para ser lembrado em um horario
-   Use a tag [LEMBRETE horario:HH:MM: descricao]
-
-4. PRIORIZAR: quando pedir o que fazer primeiro ou o que e mais urgente
-   Liste as tarefas ordenadas por prioridade com sugestao de por onde comecar
-
-5. RESUMO: quando pedir para resumir um texto
-   Entregue em ate 5 bullets objetivos
-
-6. RASCUNHO: quando pedir para escrever algo
-   Entregue o texto pronto para copiar e colar
-
-7. PERGUNTA: responda de forma direta e pratica
+[TAREFA prioridade:alta/normal/baixa prazo:DD/MM: descricao]
+[CONCLUIR: descricao]
+[LEMBRETE horario:HH:MM: descricao]
 
 Regras:
 {regras}
+
 {contexto_tarefas}
-{contexto_lembretes}""".format(
-        nome=config.get("nome_assistente", "Assistente"),
-        tom=config.get("tom", "amigavel"),
-        idioma=config.get("idioma", "portugues"),
-        regras=regras,
-        contexto_tarefas=contexto_tarefas,
-        contexto_lembretes=contexto_lembretes
-    )
+{contexto_lembretes}
+"""
 
+
+# 🔥 MELHORADO: suporta múltiplas tags
 def detectar_tags(resposta, usuario_id):
-    # Detecta TAREFA
-    if "[TAREFA" in resposta and "]" in resposta:
-        inicio = resposta.index("[TAREFA")
-        fim = resposta.index("]", inicio)
-        conteudo = resposta[inicio+7:fim].strip()
+    import re
 
+    # TAREFAS
+    tarefas = re.findall(r"\[TAREFA(.*?)\]", resposta)
+    for t in tarefas:
         prioridade = "normal"
         prazo = None
-        descricao = conteudo
+        descricao = t.strip()
 
-        if "prioridade:" in conteudo:
-            p_start = conteudo.index("prioridade:") + 11
-            resto = conteudo[p_start:]
-            p_end = resto.index(" ") if " " in resto else len(resto)
-            prioridade = resto[:p_end].strip()
-            descricao = descricao.replace("prioridade:" + prioridade, "").strip()
+        if "prioridade:" in t:
+            prioridade = re.search(r"prioridade:(\w+)", t)
+            prioridade = prioridade.group(1) if prioridade else "normal"
 
-        if "prazo:" in conteudo:
-            pz_start = conteudo.index("prazo:") + 6
-            resto = conteudo[pz_start:]
-            pz_end = resto.index(" ") if " " in resto else len(resto)
-            prazo = resto[:pz_end].strip().rstrip(":")
-            descricao = descricao.replace("prazo:" + prazo, "").strip().strip(":")
+        if "prazo:" in t:
+            prazo_match = re.search(r"prazo:([\d/]+)", t)
+            prazo = prazo_match.group(1) if prazo_match else None
 
-        salvar_tarefa(usuario_id, descricao.strip(), prioridade, prazo)
+        descricao = re.sub(r"(prioridade:\w+|prazo:[\d/]+)", "", descricao).strip(": ").strip()
 
-    # Detecta CONCLUIR
-    if "[CONCLUIR:" in resposta and "]" in resposta:
-        inicio = resposta.index("[CONCLUIR:") + 10
-        fim = resposta.index("]", inicio)
-        descricao = resposta[inicio:fim].strip()
-        concluir_tarefa(usuario_id, descricao)
+        salvar_tarefa(usuario_id, descricao, prioridade, prazo)
 
-    # Detecta LEMBRETE
-    if "[LEMBRETE" in resposta and "]" in resposta:
-        inicio = resposta.index("[LEMBRETE")
-        fim = resposta.index("]", inicio)
-        conteudo = resposta[inicio+9:fim].strip()
+    # CONCLUIR
+    concluidas = re.findall(r"\[CONCLUIR:(.*?)\]", resposta)
+    for c in concluidas:
+        concluir_tarefa(usuario_id, c.strip())
 
-        horario = ""
-        descricao = conteudo
+    # LEMBRETES
+    lembretes = re.findall(r"\[LEMBRETE(.*?)\]", resposta)
+    for l in lembretes:
+        horario_match = re.search(r"horario:(\d{2}:\d{2})", l)
+        horario = horario_match.group(1) if horario_match else None
 
-        if "horario:" in conteudo:
-            h_start = conteudo.index("horario:") + 8
-            resto = conteudo[h_start:]
-            h_end = resto.index(" ") if " " in resto else len(resto)
-            horario = resto[:h_end].strip().rstrip(":")
-            descricao = descricao.replace("horario:" + horario, "").strip().strip(":")
+        descricao = re.sub(r"horario:\d{2}:\d{2}", "", l).strip(": ").strip()
 
         if horario:
-            salvar_lembrete(usuario_id, descricao.strip(), horario)
+            salvar_lembrete(usuario_id, descricao, horario)
+
 
 def limpar_resposta(resposta):
-    tags = ["[TAREFA", "[CONCLUIR:", "[LEMBRETE"]
-    for tag in tags:
-        while tag in resposta and "]" in resposta:
-            inicio = resposta.index(tag)
-            fim = resposta.index("]", inicio) + 1
-            resposta = resposta[:inicio] + resposta[fim:]
-    return resposta.strip()
+    import re
+    return re.sub(r"\[(TAREFA|CONCLUIR|LEMBRETE).*?\]", "", resposta).strip()
+
+
+def formatar_historico(historico):
+    # 🔥 GARANTE formato correto pro LLM
+    mensagens = []
+    for h in historico:
+        mensagens.append({
+            "role": h["role"],
+            "content": h["content"]
+        })
+    return mensagens
+
 
 def processar_mensagem(usuario_id, mensagem):
     salvar_mensagem(usuario_id, "user", mensagem)
@@ -154,17 +136,28 @@ def processar_mensagem(usuario_id, mensagem):
 
     system_prompt = montar_system_prompt(config, tarefas, lembretes)
 
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            *historico
-        ]
-    )
+    mensagens = [
+        {"role": "system", "content": system_prompt},
+        *formatar_historico(historico),
+        {"role": "user", "content": mensagem}  # 🔥 IMPORTANTE
+    ]
 
-    resposta = response.choices[0].message.content
+    try:
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=mensagens,
+            temperature=0.7
+        )
+
+        resposta = response.choices[0].message.content
+
+    except Exception as e:
+        print("Erro na Groq:", e)
+        resposta = "⚠️ Tive um problema ao processar sua mensagem. Tente novamente."
+
     detectar_tags(resposta, usuario_id)
     resposta_limpa = limpar_resposta(resposta)
+
     salvar_mensagem(usuario_id, "assistant", resposta_limpa)
 
     return resposta_limpa
