@@ -11,8 +11,8 @@ import json
 load_dotenv()
 init_db()
 
-# 🔥 CORREÇÃO: strip() para evitar erro de header
 api_key = os.getenv("GROQ_API_KEY", "").strip()
+print("API KEY DEBUG:", repr(os.getenv("GROQ_API_KEY")))
 
 client = Groq(api_key=api_key)
 
