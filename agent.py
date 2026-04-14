@@ -1,4 +1,7 @@
 from groq import Groq
+
+import boto3
+import json as json_lib
 from dotenv import load_dotenv
 from database import (
     init_db, salvar_mensagem, buscar_historico,
@@ -14,7 +17,13 @@ init_db()
 api_key = os.getenv("GROQ_API_KEY", "").strip()
 print("API KEY DEBUG:", repr(os.getenv("GROQ_API_KEY")))
 
-client = Groq(api_key=api_key)
+client = Groq(api_key=api_key);
+
+bedrock = boto3.client(
+    service_name="bedrock-runtime",
+    region_name=os.getenv("AWS_REGION", "us-east-1")
+)
+BEDROCK_MODEL = os.getenv("BEDROCK_MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0")
 
 
 def carregar_config():
@@ -143,13 +152,22 @@ def processar_mensagem(usuario_id, mensagem):
     ]
 
     try:
-        response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=mensagens,
-            temperature=0.7
+        
+
+        body = json_lib.dumps({
+    "anthropic_version": "bedrock-2023-05-31",
+    "max_tokens": 1024,
+    "system": system_prompt,
+    "messages": historico
+})
+
+        response = bedrock.invoke_model(
+            modelId=BEDROCK_MODEL,
+            body=body
         )
 
-        resposta = response.choices[0].message.content
+        result = json_lib.loads(response["body"].read())
+        resposta = result["content"][0]["text"]
 
     except Exception as e:
         print("Erro na Groq:", e)
