@@ -1,7 +1,6 @@
-from groq import Groq
-
 import boto3
 import json as json_lib
+from groq import Groq
 from dotenv import load_dotenv
 from database import (
     init_db, salvar_mensagem, buscar_historico,
@@ -9,28 +8,25 @@ from database import (
     salvar_lembrete, listar_lembretes
 )
 import os
-import json
 
 load_dotenv()
 init_db()
 
-api_key = os.getenv("GROQ_API_KEY", "").strip()
-print("API KEY DEBUG:", repr(os.getenv("GROQ_API_KEY")))
-
-client = Groq(api_key=api_key);
-
+# Bedrock (principal)
 bedrock = boto3.client(
     service_name="bedrock-runtime",
     region_name=os.getenv("AWS_REGION", "us-east-1")
 )
 BEDROCK_MODEL = os.getenv("BEDROCK_MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0")
 
+# Groq (fallback)
+groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 def carregar_config():
     try:
         with open("config.json", "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
+            return json_lib.load(f)
+    except:
         return {
             "nome_assistente": "Assistente",
             "tom": "amigavel e direto",
@@ -39,101 +35,160 @@ def carregar_config():
             "saudacao": "Oi! Como posso te ajudar?"
         }
 
-
 def montar_system_prompt(config, tarefas, lembretes):
     regras = "\n".join([f"- {r}" for r in config.get("regras_extras", [])])
 
     contexto_tarefas = ""
     if tarefas:
         itens = "\n".join([
-            f"- [ID:{t[0]}] {t[1]} | prioridade: {t[2]}" +
-            (f" | prazo: {t[3]}" if t[3] else "")
+            "- [ID:{}] {} | prioridade: {}".format(t[0], t[1], t[2]) +
+            (" | prazo: {}".format(t[3]) if t[3] else "")
             for t in tarefas
         ])
-        contexto_tarefas = f"\n\nTarefas pendentes:\n{itens}"
+        contexto_tarefas = "\n\nTarefas pendentes do usuario (ordenadas por prioridade):\n" + itens
 
     contexto_lembretes = ""
     if lembretes:
-        itens = "\n".join([
-            f"- [ID:{l[0]}] {l[1]} às {l[2]}"
-            for l in lembretes
-        ])
-        contexto_lembretes = f"\n\nLembretes:\n{itens}"
+        itens = "\n".join(["- [ID:{}] {} as {}".format(l[0], l[1], l[2]) for l in lembretes])
+        contexto_lembretes = "\n\nLembretes agendados:\n" + itens
 
-    return f"""
-Voce e {config.get("nome_assistente")}, um assistente de produtividade pessoal no WhatsApp.
-Tom: {config.get("tom")}
-Idioma: {config.get("idioma")}
+    return """Voce e {nome}, um assistente de produtividade pessoal no WhatsApp.
+Tom: {tom}
+Idioma: {idioma}
 
-Funcoes:
+Voce ajuda o usuario com os seguintes caminhos:
 
-[TAREFA prioridade:alta/normal/baixa prazo:DD/MM: descricao]
-[CONCLUIR: descricao]
-[LEMBRETE horario:HH:MM: descricao]
+1. TAREFA: quando mencionar algo que precisa fazer
+   Use a tag [TAREFA prioridade:alta/normal/baixa prazo:DD/MM: descricao]
+   Identifique a prioridade pelo contexto (urgente, hoje, importante = alta)
+
+2. CONCLUIR: quando disser que terminou ou concluiu algo
+   Use a tag [CONCLUIR: parte do nome da tarefa]
+
+3. LEMBRETE: quando pedir para ser lembrado em um horario
+   Use a tag [LEMBRETE horario:HH:MM: descricao]
+
+4. PRIORIZAR: quando pedir o que fazer primeiro ou o que e mais urgente
+   Liste as tarefas ordenadas por prioridade com sugestao de por onde comecar
+
+5. RESUMO: quando pedir para resumir um texto
+   Entregue em ate 5 bullets objetivos
+
+6. RASCUNHO: quando pedir para escrever algo
+   Entregue o texto pronto para copiar e colar
+
+7. PERGUNTA: responda de forma direta e pratica
 
 Regras:
 {regras}
-
 {contexto_tarefas}
-{contexto_lembretes}
-"""
+{contexto_lembretes}""".format(
+        nome=config.get("nome_assistente", "Assistente"),
+        tom=config.get("tom", "amigavel"),
+        idioma=config.get("idioma", "portugues"),
+        regras=regras,
+        contexto_tarefas=contexto_tarefas,
+        contexto_lembretes=contexto_lembretes
+    )
 
+def chamar_bedrock(system_prompt, historico):
+    """Chama o Amazon Bedrock Claude como LLM principal."""
+    body = json_lib.dumps({
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 1024,
+        "system": system_prompt,
+        "messages": historico
+    })
+    response = bedrock.invoke_model(
+        modelId=BEDROCK_MODEL,
+        body=body
+    )
+    result = json_lib.loads(response["body"].read())
+    return result["content"][0]["text"]
 
-# 🔥 MELHORADO: suporta múltiplas tags
+def chamar_groq(system_prompt, historico):
+    """Chama o Groq como fallback caso o Bedrock falhe."""
+    response = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            *historico
+        ]
+    )
+    return response.choices[0].message.content
+
+def chamar_llm(system_prompt, historico):
+    """Tenta Bedrock primeiro, cai para Groq em caso de erro."""
+    try:
+        print("Chamando Bedrock Claude...")
+        resposta = chamar_bedrock(system_prompt, historico)
+        print("Bedrock OK")
+        return resposta, "bedrock"
+    except Exception as e:
+        print(f"Bedrock falhou: {e}")
+        print("Usando fallback Groq...")
+        resposta = chamar_groq(system_prompt, historico)
+        print("Groq OK (fallback)")
+        return resposta, "groq"
+
 def detectar_tags(resposta, usuario_id):
-    import re
+    if "[TAREFA" in resposta and "]" in resposta:
+        inicio = resposta.index("[TAREFA")
+        fim = resposta.index("]", inicio)
+        conteudo = resposta[inicio+7:fim].strip()
 
-    # TAREFAS
-    tarefas = re.findall(r"\[TAREFA(.*?)\]", resposta)
-    for t in tarefas:
         prioridade = "normal"
         prazo = None
-        descricao = t.strip()
+        descricao = conteudo
 
-        if "prioridade:" in t:
-            prioridade = re.search(r"prioridade:(\w+)", t)
-            prioridade = prioridade.group(1) if prioridade else "normal"
+        if "prioridade:" in conteudo:
+            p_start = conteudo.index("prioridade:") + 11
+            resto = conteudo[p_start:]
+            p_end = resto.index(" ") if " " in resto else len(resto)
+            prioridade = resto[:p_end].strip()
+            descricao = descricao.replace("prioridade:" + prioridade, "").strip()
 
-        if "prazo:" in t:
-            prazo_match = re.search(r"prazo:([\d/]+)", t)
-            prazo = prazo_match.group(1) if prazo_match else None
+        if "prazo:" in conteudo:
+            pz_start = conteudo.index("prazo:") + 6
+            resto = conteudo[pz_start:]
+            pz_end = resto.index(" ") if " " in resto else len(resto)
+            prazo = resto[:pz_end].strip().rstrip(":")
+            descricao = descricao.replace("prazo:" + prazo, "").strip().strip(":")
 
-        descricao = re.sub(r"(prioridade:\w+|prazo:[\d/]+)", "", descricao).strip(": ").strip()
+        salvar_tarefa(usuario_id, descricao.strip(), prioridade, prazo)
 
-        salvar_tarefa(usuario_id, descricao, prioridade, prazo)
+    if "[CONCLUIR:" in resposta and "]" in resposta:
+        inicio = resposta.index("[CONCLUIR:") + 10
+        fim = resposta.index("]", inicio)
+        descricao = resposta[inicio:fim].strip()
+        concluir_tarefa(usuario_id, descricao)
 
-    # CONCLUIR
-    concluidas = re.findall(r"\[CONCLUIR:(.*?)\]", resposta)
-    for c in concluidas:
-        concluir_tarefa(usuario_id, c.strip())
+    if "[LEMBRETE" in resposta and "]" in resposta:
+        inicio = resposta.index("[LEMBRETE")
+        fim = resposta.index("]", inicio)
+        conteudo = resposta[inicio+9:fim].strip()
 
-    # LEMBRETES
-    lembretes = re.findall(r"\[LEMBRETE(.*?)\]", resposta)
-    for l in lembretes:
-        horario_match = re.search(r"horario:(\d{2}:\d{2})", l)
-        horario = horario_match.group(1) if horario_match else None
+        horario = ""
+        descricao = conteudo
 
-        descricao = re.sub(r"horario:\d{2}:\d{2}", "", l).strip(": ").strip()
+        if "horario:" in conteudo:
+            h_start = conteudo.index("horario:") + 8
+            resto = conteudo[h_start:]
+            h_end = resto.index(" ") if " " in resto else len(resto)
+            horario = resto[:h_end].strip().rstrip(":")
+            descricao = descricao.replace("horario:" + horario, "").strip().strip(":")
 
         if horario:
-            salvar_lembrete(usuario_id, descricao, horario)
-
+            salvar_lembrete(usuario_id, descricao.strip(), horario)
 
 def limpar_resposta(resposta):
-    import re
-    return re.sub(r"\[(TAREFA|CONCLUIR|LEMBRETE).*?\]", "", resposta).strip()
-
-
-def formatar_historico(historico):
-    # 🔥 GARANTE formato correto pro LLM
-    mensagens = []
-    for h in historico:
-        mensagens.append({
-            "role": h["role"],
-            "content": h["content"]
-        })
-    return mensagens
-
+    tags = ["[TAREFA", "[CONCLUIR:", "[LEMBRETE"]
+    for tag in tags:
+        while tag in resposta and "]" in resposta:
+            inicio = resposta.index(tag)
+            fim = resposta.index("]", inicio) + 1
+            resposta = resposta[:inicio] + resposta[fim:]
+    return resposta.strip()
 
 def processar_mensagem(usuario_id, mensagem):
     salvar_mensagem(usuario_id, "user", mensagem)
@@ -145,37 +200,11 @@ def processar_mensagem(usuario_id, mensagem):
 
     system_prompt = montar_system_prompt(config, tarefas, lembretes)
 
-    mensagens = [
-        {"role": "system", "content": system_prompt},
-        *formatar_historico(historico),
-        {"role": "user", "content": mensagem}  # 🔥 IMPORTANTE
-    ]
-
-    try:
-        
-
-        body = json_lib.dumps({
-    "anthropic_version": "bedrock-2023-05-31",
-    "max_tokens": 1024,
-    "system": system_prompt,
-    "messages": historico
-})
-
-        response = bedrock.invoke_model(
-            modelId=BEDROCK_MODEL,
-            body=body
-        )
-
-        result = json_lib.loads(response["body"].read())
-        resposta = result["content"][0]["text"]
-
-    except Exception as e:
-        print("Erro na Groq:", e)
-        resposta = "⚠️ Tive um problema ao processar sua mensagem. Tente novamente."
+    resposta, provedor = chamar_llm(system_prompt, historico)
+    print(f"Resposta gerada via: {provedor}")
 
     detectar_tags(resposta, usuario_id)
     resposta_limpa = limpar_resposta(resposta)
-
     salvar_mensagem(usuario_id, "assistant", resposta_limpa)
 
     return resposta_limpa
