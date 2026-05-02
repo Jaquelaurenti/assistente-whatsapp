@@ -4,6 +4,7 @@ __pycache__/
 *$py.class
 credentials.json
 token_calendar.pickle
+token_gmail.pickle
 
 # C extensions
 *.so
