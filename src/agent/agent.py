@@ -2,7 +2,7 @@ import boto3
 import json as json_lib
 from groq import Groq
 from dotenv import load_dotenv
-from database import (
+from src.database.repository import (
     init_db, salvar_mensagem, buscar_historico,
     salvar_tarefa, listar_tarefas, concluir_tarefa,
     salvar_lembrete, listar_lembretes
@@ -22,9 +22,11 @@ BEDROCK_MODEL = os.getenv("BEDROCK_MODEL_ID", "anthropic.claude-3-haiku-20240307
 # Groq (fallback)
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
+
 def carregar_config():
+    config_path = os.path.join(os.path.dirname(__file__), "config.json")
     try:
-        with open("config.json", "r", encoding="utf-8") as f:
+        with open(config_path, "r", encoding="utf-8") as f:
             return json_lib.load(f)
     except:
         return {
@@ -35,7 +37,8 @@ def carregar_config():
             "saudacao": "Oi! Como posso te ajudar?"
         }
 
-def montar_system_prompt(config, tarefas, lembretes):
+
+def montar_system_prompt(config: dict, tarefas: list, lembretes: list) -> str:
     regras = "\n".join([f"- {r}" for r in config.get("regras_extras", [])])
 
     contexto_tarefas = ""
@@ -91,120 +94,102 @@ Regras:
         contexto_lembretes=contexto_lembretes
     )
 
-def chamar_bedrock(system_prompt, historico):
-    """Chama o Amazon Bedrock Claude como LLM principal."""
+
+def chamar_bedrock(system_prompt: str, historico: list) -> str:
     body = json_lib.dumps({
         "anthropic_version": "bedrock-2023-05-31",
         "max_tokens": 1024,
         "system": system_prompt,
         "messages": historico
     })
-    response = bedrock.invoke_model(
-        modelId=BEDROCK_MODEL,
-        body=body
-    )
+    response = bedrock.invoke_model(modelId=BEDROCK_MODEL, body=body)
     result = json_lib.loads(response["body"].read())
     return result["content"][0]["text"]
 
-def chamar_groq(system_prompt, historico):
-    """Chama o Groq como fallback caso o Bedrock falhe."""
+
+def chamar_groq(system_prompt: str, historico: list) -> str:
     response = groq_client.chat.completions.create(
         model="llama-3.3-70b-versatile",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            *historico
-        ]
+        messages=[{"role": "system", "content": system_prompt}, *historico]
     )
     return response.choices[0].message.content
 
-def chamar_llm(system_prompt, historico):
-    """Tenta Bedrock primeiro, cai para Groq em caso de erro."""
+
+def chamar_llm(system_prompt: str, historico: list) -> tuple:
     try:
         print("Chamando Bedrock Claude...")
         resposta = chamar_bedrock(system_prompt, historico)
         print("Bedrock OK")
         return resposta, "bedrock"
     except Exception as e:
-        print(f"Bedrock falhou: {e}")
-        print("Usando fallback Groq...")
+        print(f"Bedrock falhou: {e} — usando Groq")
         resposta = chamar_groq(system_prompt, historico)
         print("Groq OK (fallback)")
         return resposta, "groq"
 
-def detectar_tags(resposta, usuario_id):
+
+def detectar_tags(resposta: str, usuario_id: str):
     if "[TAREFA" in resposta and "]" in resposta:
         inicio = resposta.index("[TAREFA")
         fim = resposta.index("]", inicio)
         conteudo = resposta[inicio+7:fim].strip()
-
         prioridade = "normal"
         prazo = None
         descricao = conteudo
-
         if "prioridade:" in conteudo:
             p_start = conteudo.index("prioridade:") + 11
             resto = conteudo[p_start:]
             p_end = resto.index(" ") if " " in resto else len(resto)
             prioridade = resto[:p_end].strip()
             descricao = descricao.replace("prioridade:" + prioridade, "").strip()
-
         if "prazo:" in conteudo:
             pz_start = conteudo.index("prazo:") + 6
             resto = conteudo[pz_start:]
             pz_end = resto.index(" ") if " " in resto else len(resto)
             prazo = resto[:pz_end].strip().rstrip(":")
             descricao = descricao.replace("prazo:" + prazo, "").strip().strip(":")
-
         salvar_tarefa(usuario_id, descricao.strip(), prioridade, prazo)
 
     if "[CONCLUIR:" in resposta and "]" in resposta:
         inicio = resposta.index("[CONCLUIR:") + 10
         fim = resposta.index("]", inicio)
-        descricao = resposta[inicio:fim].strip()
-        concluir_tarefa(usuario_id, descricao)
+        concluir_tarefa(usuario_id, resposta[inicio:fim].strip())
 
     if "[LEMBRETE" in resposta and "]" in resposta:
         inicio = resposta.index("[LEMBRETE")
         fim = resposta.index("]", inicio)
         conteudo = resposta[inicio+9:fim].strip()
-
         horario = ""
         descricao = conteudo
-
         if "horario:" in conteudo:
             h_start = conteudo.index("horario:") + 8
             resto = conteudo[h_start:]
             h_end = resto.index(" ") if " " in resto else len(resto)
             horario = resto[:h_end].strip().rstrip(":")
             descricao = descricao.replace("horario:" + horario, "").strip().strip(":")
-
         if horario:
             salvar_lembrete(usuario_id, descricao.strip(), horario)
 
-def limpar_resposta(resposta):
-    tags = ["[TAREFA", "[CONCLUIR:", "[LEMBRETE"]
-    for tag in tags:
+
+def limpar_resposta(resposta: str) -> str:
+    for tag in ["[TAREFA", "[CONCLUIR:", "[LEMBRETE"]:
         while tag in resposta and "]" in resposta:
             inicio = resposta.index(tag)
             fim = resposta.index("]", inicio) + 1
             resposta = resposta[:inicio] + resposta[fim:]
     return resposta.strip()
 
-def processar_mensagem(usuario_id, mensagem):
-    salvar_mensagem(usuario_id, "user", mensagem)
 
+def processar_mensagem(usuario_id: str, mensagem: str) -> str:
+    salvar_mensagem(usuario_id, "user", mensagem)
     historico = buscar_historico(usuario_id, limite=10)
     tarefas = listar_tarefas(usuario_id)
     lembretes = listar_lembretes(usuario_id)
     config = carregar_config()
-
     system_prompt = montar_system_prompt(config, tarefas, lembretes)
-
     resposta, provedor = chamar_llm(system_prompt, historico)
     print(f"Resposta gerada via: {provedor}")
-
     detectar_tags(resposta, usuario_id)
     resposta_limpa = limpar_resposta(resposta)
     salvar_mensagem(usuario_id, "assistant", resposta_limpa)
-
     return resposta_limpa
